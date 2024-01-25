@@ -292,7 +292,7 @@ def train_detector(model, dataset, cfg, distributed=False, validate=False, logge
             device_ids=[cfg.local_rank],
             output_device=cfg.local_rank,
             # broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
     else:
         model = model.cuda()

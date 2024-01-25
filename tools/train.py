@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import sys
-
+sys.path.append('/home/durbin/projs/centerformer_new')
 from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWarning, NumbaWarning
 import warnings
 warnings.simplefilter('ignore', category=NumbaDeprecationWarning)

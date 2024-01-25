@@ -138,7 +138,7 @@ def main():
             device_ids=[cfg.local_rank],
             output_device=cfg.local_rank,
             # broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False, #  True,
         )
     else:
         # model = fuse_bn_recursively(model)
