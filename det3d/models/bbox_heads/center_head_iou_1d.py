@@ -11,6 +11,7 @@ from det3d.core import box_torch_ops
 import torch
 from det3d.torchie.cnn import kaiming_init
 from torch import double, nn
+from torch.nn import functional as F
 from det3d.models.losses.centernet_loss import FastFocalLoss, RegLoss, SegLoss
 from det3d.models.utils import Sequential
 from ..registry import HEADS
@@ -81,6 +82,220 @@ class SepHead(nn.Module):
 
         return x
 
+class BaseConv(nn.Module):
+    """A Conv2d -> Batchnorm -> silu/leaky relu block"""
+
+    def __init__(
+        self, in_channels, out_channels, ksize, stride, groups=1, bias=False, act="silu"
+    ):
+        super().__init__()
+        # same padding
+        pad = (ksize - 1) // 2
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=ksize,
+            stride=stride,
+            padding=pad,
+            groups=groups,
+            bias=bias,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
+
+def kaiming_init(
+            module, a=0, mode="fan_out", nonlinearity="relu", bias=0, distribution="normal"
+):
+    assert distribution in ["uniform", "normal"]
+    if distribution == "uniform":
+        nn.init.kaiming_uniform_(
+            module.weight, a=a, mode=mode, nonlinearity=nonlinearity
+        )
+    else:
+        nn.init.kaiming_normal_(
+            module.weight, a=a, mode=mode, nonlinearity=nonlinearity
+        )
+    if hasattr(module, "bias") and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+class AuxiliaryHead(nn.Module):
+    def __init__(self, aux_config, in_channel, act="silu", depthwise=False):
+        super().__init__()
+        aux_config = dict(
+                isvalid = True,
+                # isvalid = False,
+                fg_cls_branch = True,  # [foreground, background]
+                ct_reg_branch = True,  # [center_dx, center_dy]
+                fg_cls_weight = 0.6,
+                ct_reg_weight = 1.2,
+                ct_reg_loss_type = 'l1',  # l1, huber
+                aux_head_source = 'asff',  # d12345, asff
+                fg_definition = 'in_gt_points',  # in_gt_points (fg), in_gt_voxels (fg2), in_gt_non_empty_voxels (fg3)
+                aux_head_in_channel = 128,
+                aux_head_feat_channel = 128,
+                act = 'relu',) #   silu (default), relu
+        self.aux_config = aux_config
+        self.fg_cls_branch = aux_config.get('fg_cls_branch', False)
+        self.ct_reg_branch = aux_config.get('ct_reg_branch', False)
+
+        Conv = BaseConv
+        feat_channel = in_channel
+
+        self.stem = BaseConv(
+            in_channels=int(in_channel),
+            out_channels=int(feat_channel),
+            ksize=1,
+            stride=1,
+            act=act,
+        )
+        if act == 'relu':
+            for m in self.stem.modules():
+                if isinstance(m, nn.Conv2d):
+                    kaiming_init(m)
+        # Foreground classification (fg)
+        self.fg_cls_conv = nn.Sequential(*[
+            Conv(
+                in_channels=int(feat_channel),
+                out_channels=int(feat_channel),
+                ksize=3,
+                stride=1,
+                act=act,
+            ),
+            Conv(
+                in_channels=int(feat_channel),
+                out_channels=int(feat_channel),
+                ksize=3,
+                stride=1,
+                act=act,
+            ),
+        ])
+        # if act == 'relu':
+        #     for m in self.fg_cls_conv.modules():
+        #         if isinstance(m, nn.Conv2d):
+        #             kaiming_init(m)
+
+        self.fg_preds = nn.Conv2d(
+            in_channels=int(feat_channel),
+            out_channels=1,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+        )
+        # if act == 'relu':
+        #     pi = 0.01
+        #     nn.init.constant_(self.fg_preds.bias, -np.log((1 - pi) / pi))
+        
+        # center vote pred branch
+        if self.ct_reg_branch:
+            self.ct_reg_conv = nn.Sequential(*[
+                Conv(
+                    in_channels=int(feat_channel),
+                    out_channels=int(feat_channel),
+                    ksize=3,
+                    stride=1,
+                    act=act,
+                ),
+                Conv(
+                    in_channels=int(feat_channel),
+                    out_channels=int(feat_channel),
+                    ksize=3,
+                    stride=1,
+                    act=act,
+                ),
+            ])
+            if act == 'relu':
+                for m in self.ct_reg_conv.modules():
+                    if isinstance(m, nn.Conv2d):
+                        kaiming_init(m)
+
+            self.ct_preds = nn.Conv2d(
+                in_channels=int(feat_channel),
+                out_channels=2,  # [dx, dy]
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            )
+            if act == 'relu':
+                for m in self.ct_preds.modules():
+                    if isinstance(m, nn.Conv2d):
+                        kaiming_init(m)
+    def transpose_gather_feat(self, feat, mask):
+        feat = feat.permute(0, 2, 3, 1).contiguous()
+        mask = mask.permute(0, 2, 3, 1).contiguous()
+        return feat[mask].view(-1, feat.shape[-1])
+
+    def fg_focal_loss(self, x, y, weights=None, alpha=0.25, gamma=2.0):
+        pred_sigmoid = torch.sigmoid(x)
+        alpha_weight = y * alpha + (1 - y) * (1 - alpha)
+        pt = y * (1.0 - pred_sigmoid) + (1.0 - y) * pred_sigmoid
+        focal_weight = alpha_weight * torch.pow(pt, gamma)
+
+        bce_loss = torch.clamp(x, min=0) - x * y + torch.log1p(torch.exp(-torch.abs(x)))
+
+        loss = focal_weight * bce_loss
+
+        if weights is not None:
+            loss = loss * weights
+
+        return loss.sum()
+
+    def huber_loss(self, error, delta=1.0):
+        abs_error = torch.abs(error)
+        # quadratic = torch.minimum(abs_error, delta)
+        quadratic = torch.minimum(abs_error, torch.ones(abs_error.shape, device=abs_error.device) * delta)
+        linear = (abs_error - quadratic)
+        losses = 0.5 * quadratic ** 2 + delta * linear
+        return losses
+
+    def forward(self, x):
+        x = self.stem(x)
+        fg_out = self.fg_cls_conv(x)
+        fg_pred = self.fg_preds(fg_out)
+        out = (fg_pred,)
+
+        if self.ct_reg_branch:
+            ct_out = self.ct_reg_conv(x)
+            ct_pred = self.ct_preds(ct_out)
+            out += (ct_pred,)
+
+        return out
+    
+    def loss(self, fg_pred, ct_pred, fg_truth, ct_truth):
+        fg_cls_weight = 0.6
+        ct_reg_weight = 1
+        ct_reg_loss_type = 'l1'
+
+        cared = (fg_truth >= 0)
+        fg_mask = fg_truth > 0
+        num_fg = fg_mask.sum()
+        fg_weights = cared / torch.clamp(num_fg, min=1.0)
+
+        fg_loss = self.fg_focal_loss(fg_pred, fg_truth, weights=fg_weights) * fg_cls_weight
+
+        if num_fg.item() == 0:
+            ct_offset_loss = torch.tensor(0.0, device=fg_pred.device)
+        else:
+            fg_mask = fg_mask.expand_as(ct_truth)
+            masked_ct_pred = self.transpose_gather_feat(ct_pred, fg_mask)
+            masked_ct_truth = self.transpose_gather_feat(ct_truth, fg_mask)
+
+            if ct_reg_loss_type == 'l1':
+                ct_offset_loss = F.l1_loss(masked_ct_pred, masked_ct_truth, size_average=False) * ct_reg_weight / num_fg
+            elif ct_reg_loss_type == 'huber':
+                ct_offset_loss = self.huber_loss(masked_ct_truth - masked_ct_pred).sum() * ct_reg_weight / num_fg
+            else:
+                raise NotImplementedError
+
+        return fg_loss, ct_offset_loss
+
+
+
 
 @HEADS.register_module
 class CenterHeadIoU_1d(nn.Module):
@@ -92,6 +307,7 @@ class CenterHeadIoU_1d(nn.Module):
         weight=0.25,
         iou_weight=1,
         corner_weight=1,
+        aux_weight = 1,  # auxilary task loss weight
         code_weights=[],
         common_heads=dict(),
         logger=None,
@@ -101,6 +317,7 @@ class CenterHeadIoU_1d(nn.Module):
         iou_loss=False,
         corner_loss=False,
         iou_factor=[1, 1, 4],
+        with_AuxTask=False  # use fg/ct auxilary or not 
     ):
         super(CenterHeadIoU_1d, self).__init__()
 
@@ -110,6 +327,7 @@ class CenterHeadIoU_1d(nn.Module):
         self.weight = weight  # weight between hm loss and loc loss
         self.iou_weight = iou_weight
         self.corner_weight = corner_weight
+        self.aux_weight = aux_weight
         self.dataset = dataset
         self.iou_factor = iou_factor
 
@@ -142,6 +360,11 @@ class CenterHeadIoU_1d(nn.Module):
         )
 
         self.tasks = nn.ModuleList()
+        self.with_AuxTask =  with_AuxTask
+        if self.with_AuxTask:
+            print("use auxilary head")
+            self.aux_head = AuxiliaryHead(aux_config=None, in_channel=64, act='relu')
+        
         print("Use HM Bias: ", init_bias)
 
         for num_cls in num_classes:
@@ -168,7 +391,11 @@ class CenterHeadIoU_1d(nn.Module):
             y = self.shared_conv(x["ct_feat"].float())
             for idx, task in enumerate(self.tasks):
                 ret_dicts.append(task(x, y))
-                
+        if self.with_AuxTask:
+            # import pdb;pdb.set_trace()
+            aux_feat = x['aux_feat']
+            aux_pred = self.aux_head(aux_feat)
+            ret_dicts[0]['aux_pred'] = aux_pred # ([1, 1, 752, 752] [1, 2, 752, 752])  TODO 前面的[0]是什么，多卡会有[1]么->不会，多卡还是[0s]
         return ret_dicts
 
     def _sigmoid(self, x):
@@ -278,12 +505,28 @@ class CenterHeadIoU_1d(nn.Module):
                     preds_dict["iou"].reshape(-1), iou_targets
                 ) * mask.reshape(-1)
                 iou_loss = iou_loss.sum() / (mask.sum() + 1e-4)
+            
+            if self.with_AuxTask:
+                # 因为只有OD的任务，所以不用那个mask_pred分出OD数据
+
+                # 单卡bs=2: (2,1,752,752) (2,2,752,752)   
+                # 双卡bs=1: (1,1,752,752) (1,2,752,752) 
+                fg_pred, ct_pred = preds_dicts[0]['aux_pred']
+                # example i.e. groundtruth
+                gt_aux_label = torch.from_numpy(example['aux_label']).to(fg_pred)  # (2,1,752,752)
+                gt_aux_reg = torch.from_numpy(example['aux_reg']).to(fg_pred)  # (2,2,752,752)
+                aux_fg_loss, aux_ct_loss = self.aux_head.loss(fg_pred, ct_pred, gt_aux_label, gt_aux_reg)
+
 
             loss = hm_loss + self.weight * loc_loss
             if self.use_iou_loss:
                 loss = loss + self.iou_weight * iou_loss
             if self.corner_loss:
                 loss = loss + self.corner_weight * corner_loss
+            if self.with_AuxTask:
+                loss = loss + self.aux_weight * (aux_fg_loss + aux_ct_loss)
+                ret.update({"aux_fg_loss": aux_fg_loss})  # difference w and w/o detach
+                ret.update({"aux_ct_loss": aux_ct_loss})
             ret.update(
                 {
                     "loss": loss,

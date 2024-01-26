@@ -9,7 +9,7 @@ from det3d.core.utils.center_utils import (
     draw_umich_gaussian, gaussian_radius
 )
 from ..registry import PIPELINES
-
+from torch import torch
 
 def _dict_select(dict_, inds):
     for k, v in dict_.items():
@@ -23,6 +23,47 @@ def drop_arrays_by_name(gt_names, used_classes):
     inds = [i for i, x in enumerate(gt_names) if x not in used_classes]
     inds = np.array(inds, dtype=np.int64)
     return inds
+
+def rotate_points_along_z(points, angle):
+    """
+    Args:
+        points: (B, N, 3 + C)
+        angle: (B,), angle along z-axis, angle increases x ==> y
+    Returns:
+
+    """
+    cosa = np.cos(angle)
+    sina = np.sin(angle)
+    zeros = np.zeros(points.shape[0])
+    ones = np.ones(points.shape[0])
+    rot_matrix = np.stack((
+        cosa, sina, zeros,
+        -sina, cosa, zeros,
+        zeros, zeros, ones
+    ), axis=1).reshape(-1, 3, 3)
+    points_rot = np.matmul(points[:, :, :3], rot_matrix)
+    points_rot = np.concatenate([points_rot, points[:, :, 3:]], axis=-1)
+    return points_rot
+def get_points_in_gt_boxes_mask(points, gt_boxes, return_point_gt_idx):
+    # gt_boxes = gt_boxes[:1]
+
+    N, M = points.shape[0], gt_boxes.shape[0]
+
+    repeat_points = points.repeat(M, axis=0)  # [NXM, 4]
+    repeat_gt_boxes = np.expand_dims(gt_boxes, axis=0).repeat(N, axis=0).reshape(-1, 7)  # [NxM, 7]
+
+    xyz_local = repeat_points[:, :3] - repeat_gt_boxes[:, :3]  # [NxM, 7]
+    xyz_local = rotate_points_along_z(xyz_local[:, None, :], -repeat_gt_boxes[:, 6]).squeeze(axis=1)
+    xy_local = xyz_local[:, :2]
+    lw = repeat_gt_boxes[:, 3:5]
+    is_in_gt_matrix = ((xy_local <= lw / 2) & (xy_local >= -lw / 2)).all(axis=-1).reshape(N, M)  # (N, M)
+    is_in_gt = np.max(is_in_gt_matrix, axis=-1)  # (N,
+
+    if return_point_gt_idx:
+        points_idx, gt_boxes_idx = np.where(is_in_gt_matrix == 1)
+        return points_idx, gt_boxes_idx
+
+    return is_in_gt, None
 
 @PIPELINES.register_module
 class Preprocess(object):
@@ -209,6 +250,7 @@ class Voxelization(object):
         )
 
         double_flip = self.double_flip and (res["mode"] != 'train')
+        print(double_flip, res['mode'])
 
         if double_flip:
             flip_voxels, flip_coordinates, flip_num_points = self.voxel_generator.generate(
@@ -286,6 +328,9 @@ class AssignLabel(object):
         self.gt_kernel_size = assigner_cfg.get('gt_kernel_size', 1)
         print('use gt label assigning kernel size ', self.gt_kernel_size)
         self.cfg = assigner_cfg
+        self.with_auxtask = assigner_cfg.get('with_AuxTask', False)
+        self.use_ignore = False # 其实相关的都没用到，一直是False
+        self.grid_size = [(assigner_cfg['pc_range'][i+3] - assigner_cfg['pc_range'][i]) / assigner_cfg['voxel_size'][i] for i in range(3)]
 
     def __call__(self, res, info):
         max_objs = self._max_objs
@@ -486,6 +531,10 @@ class AssignLabel(object):
             example.update({'hm': hms, 'anno_box': anno_boxs, 'ind': inds, 'mask': masks, 'cat': cats})
             if self.corner_prediction:
                 example.update({'corners': corners})
+            if self.with_auxtask:
+                aux_label = self.get_aux_targets(res, info)
+                example['aux_label'] = aux_label[0]
+                example['aux_reg'] = aux_label[1]
         else:
             pass
 
@@ -493,3 +542,71 @@ class AssignLabel(object):
 
         return res, info
 
+    def get_aux_targets(self, res, info):
+            gt_bboxes_3d = res['lidar']['annotations']['gt_boxes'][0]     # N*C : 40*9  only applied to bs=1, 
+            gt_boxes = gt_bboxes_3d[:, :7]  # cx cy cz l w h heading vx vy
+            # gt_labels_3d = res['lidar']['annotations']['gt_classes'][0]   #  N  : 40
+            cur_frame_pts_len = res['lidar']['points_num']
+            points = res['lidar']['points'][:cur_frame_pts_len]
+            # points = res['lidar']['points'][0][:cur_frame_pts_len]  # 当前帧点：第一个combine的前面部分,其实整个res['points']都是当前帧重复的
+            # is_ignore = torch.empty((len(gt_bboxes_3d), )).fill_(-1)
+
+            voxel_size = [ size*2 for size in self.cfg['voxel_size']]  # two times down sampling
+            # mask_pts = points[:, -1] == 0
+            # points = points[mask_pts]
+            # ignore_mask = is_ignore == 1
+            
+            # gt_boxes = gt_bboxes_3d[~ignore_mask][:, :7]
+            # gt_boxes_ignore = gt_bboxes_3d[ignore_mask][:, :7]
+
+            length, width = np.array(self.grid_size[:2]) / 2
+            length, width = int(length), int(width)
+            if len(gt_boxes) == 0:
+                aux_label1 = torch.zeros([1, width, length], dtype=torch.int32) - 1
+                aux_label2 = torch.zeros([2, width, length], dtype=torch.float32) - 1
+                return (aux_label1, aux_label2)
+            voxel_label = -np.ones((length * width), dtype='int32')
+            self.pc_range = np.array(self.cfg['pc_range'])
+            # import pdb;pdb.set_trace()
+            x, y = points[:, 0], points[:, 1]
+            l = (x - self.pc_range[0]) // voxel_size[0]
+            w = (y - self.pc_range[1]) // voxel_size[1]
+            is_in_pc_range = (l < length) & (l >= 0) & (w < width) & (w >= 0)
+            points = points[is_in_pc_range]   # 183680
+            l, w = l[is_in_pc_range], w[is_in_pc_range]
+            non_empty_idx = (l * width + w).astype('int32') # 183680
+            voxel_label[non_empty_idx] = 0
+            return_point_gt_idx = True
+            is_in_gt, gt_boxes_idx = get_points_in_gt_boxes_mask(points, gt_boxes, return_point_gt_idx)  # 10821
+
+            #set front ground points lable as 1
+            # self.use_ignore = FAlse
+            if self.use_ignore and len(gt_boxes_ignore) > 0:
+                is_in_gt_ignored, _ = get_points_in_gt_boxes_mask(points, gt_boxes_ignore, return_point_gt_idx)
+                l_ignored, w_ignored = l[is_in_gt_ignored], w[is_in_gt_ignored]
+                fg_ignored_idx = (l_ignored * width + w_ignored).astype('int32')
+                voxel_label[fg_ignored_idx] = 1
+
+            l, w = l[is_in_gt], w[is_in_gt]   # 10821
+            fg_idx = (l * width + w).astype('int32')
+            voxel_label[fg_idx] = 1  # 565504 752*752
+
+            voxel_label = voxel_label.reshape((-1, length, width))
+            aux_label = (torch.from_numpy(voxel_label.transpose(0, 2, 1)),)  # (1,752,752)
+            if return_point_gt_idx:
+                # init dxdy offset
+                offset_label = -np.ones((2, length * width), dtype='float32')
+
+                # convert to real world coordinates
+                voxel_center = np.stack([
+                    l * voxel_size[0] + self.pc_range[0],
+                    w * voxel_size[1] + self.pc_range[1]])
+                gt_center = gt_boxes[gt_boxes_idx, :2].transpose((1, 0))  # gt box center x & y
+                # offset label
+                if len(fg_idx):
+                    offset_label[:, fg_idx] = gt_center - voxel_center    # offset between fg box and voxel
+                offset_label = offset_label.reshape((-1, length, width))
+
+                aux_label += (torch.from_numpy(offset_label.transpose(0, 2, 1)),)
+            # aux_label:((1,752,752) , (2,752, 752) )
+            return aux_label

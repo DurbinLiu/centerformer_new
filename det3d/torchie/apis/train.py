@@ -3,7 +3,7 @@ from __future__ import division
 import re
 from collections import OrderedDict, defaultdict
 from functools import partial
-
+from torchsummary import summary
 # try:
 #     import apex
 # except:
@@ -297,6 +297,8 @@ def train_detector(model, dataset, cfg, distributed=False, validate=False, logge
     else:
         model = model.cuda()
 
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"model total parameters: {total_params}")
     logger.info(f"model structure: {model}")
 
     trainer = Trainer(

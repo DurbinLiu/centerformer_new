@@ -14,7 +14,7 @@ from .. import builder
 from ..registry import NECKS
 from ..utils import build_norm_layer
 
-
+# 通道注意力
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
@@ -34,7 +34,7 @@ class ChannelAttention(nn.Module):
         out = avg_out + max_out
         return self.sigmoid(out) * x
 
-
+# 空间注意力
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
@@ -49,7 +49,7 @@ class SpatialAttention(nn.Module):
         y = self.conv1(y)
         return self.sigmoid(y) * x
 
-
+# 多帧的空间注意力
 class SpatialAttention_mtf(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention_mtf, self).__init__()
@@ -58,6 +58,7 @@ class SpatialAttention_mtf(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, curr, prev):
+        # curr: B C H W
         avg_out = torch.mean(curr, dim=1, keepdim=True)
         max_out, _ = torch.max(curr, dim=1, keepdim=True)
         y = torch.cat([avg_out, max_out], dim=1)
@@ -704,6 +705,7 @@ class RPN_transformer_deformable(RPN_transformer_base):
         ds_num_filters,  # [128,256,64]
         num_input_features,  # 256
         transformer_config=None,
+        with_AuxTask=False,
         hm_head_layer=2,
         corner_head_layer=2,
         corner=False,
@@ -758,15 +760,29 @@ class RPN_transformer_deformable(RPN_transformer_base):
         if self.parametric_embedding:
             self.query_embed = nn.Embedding(self.obj_num, self._num_filters[-1] * 2)
             nn.init.uniform_(self.query_embed.weight, -1.0, 1.0)
+        self.with_AuxTask = with_AuxTask
+
+        # aux block
+        if self.with_AuxTask:
+            self.up_aux = Sequential(
+            nn.ConvTranspose2d(
+                self._num_filters[0], 64, 2, stride=2, bias=False
+            ),
+            build_norm_layer(self._norm_cfg, 64)[1],
+            nn.ReLU(),
+        )
 
         logger.info("Finish RPN_transformer_deformable Initialization")
 
     def forward(self, x, example=None):
-
+        # x: 4 256 188 188
         # FPN
-        x = self.blocks[0](x)
-        x_down = self.blocks[1](x)
-        x_up = torch.cat([self.blocks[2](x_down), self.up(x)], dim=1)
+        x = self.blocks[0](x) # 4 256 188 188
+        x_down = self.blocks[1](x) # 4 256 94 94
+        x_up = torch.cat([self.blocks[2](x_down), self.up(x)], dim=1) # 4 256 376 376
+        if self.with_AuxTask:
+            aux_feat_2 = self.up_aux(x_up)
+            aux_feat_dict = {'aux_feat': aux_feat_2}   # 1 64 752 752
 
         # heatmap head
         hm = self.hm_head(x_up)
@@ -869,6 +885,8 @@ class RPN_transformer_deformable(RPN_transformer_base):
             out_dict.update({"out_attention": transformer_out["out_attention"]})
         if self.corner and self.corner_head.training:
             out_dict.update({"corner_hm": corner_hm})
+        if self.with_AuxTask:
+            out_dict.update(aux_feat_dict)
 
         return out_dict
 

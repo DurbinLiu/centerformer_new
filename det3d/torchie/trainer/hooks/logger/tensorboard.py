@@ -44,10 +44,18 @@ class TensorboardLoggerHook(LoggerHook):
             if isinstance(record, str):
                 self.writer.add_text(tag, record, trainer.iter)
             else:
-                self.writer.add_scalar(
+                # print(var)
+                if var in ["loc_loss_elem"]:
+                    # ckip, lists not implemented
+                    continue
+                elif var in ["transfer_time","forward_time","loss_parse_time"]:
+                    self.writer.add_scalar(
                     tag, trainer.log_buffer.output[var], trainer.iter
                 )
-
+                else:
+                    self.writer.add_scalar(
+                    tag, trainer.log_buffer.output[var][0], trainer.iter
+                )
     @master_only
     def after_run(self, trainer):
         self.writer.close()
