@@ -3,7 +3,7 @@ import copy
 import json
 import os
 import sys
-
+sys.path.append('/home/durbin/projs/centerformer_new/')
 # try:
 #     import apex
 # except:
